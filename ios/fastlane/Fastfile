@@ -1,3 +1,5 @@
+require 'fileutils'
+
 skip_docs
 
 default_platform :ios
@@ -46,6 +48,66 @@ platform :ios do
     upload_to_testflight(
       api_key: api_key,
       skip_waiting_for_build_processing: true
+    )
+  end
+
+  # ------------------------------------------------------------------
+  # Self-signed / sideload builds.
+  #
+  #   unsigned — needs no Apple credentials. Builds Runner.app with code
+  #              signing disabled and wraps it in an unencrypted IPA, ready
+  #              for a local re-signing tool (zsign, iOS App Signer, ...).
+  #   adhoc    — signs with a certificate and provisioning profiles supplied
+  #              by the workflow. Set EXPORT_METHOD to ad-hoc, development or
+  #              enterprise, and PROFILE_APP_NAME / PROFILE_TUN_NAME to the
+  #              installed profile names.
+  # ------------------------------------------------------------------
+  lane :unsigned do
+    root_dir = File.expand_path('../..', __dir__)
+    output_directory = File.expand_path('../../../output', __dir__)
+
+    Dir.chdir(root_dir) do
+      sh(*flutter_build_args('ios', '--release', '--no-codesign'))
+    end
+
+    app_path = File.join(root_dir, 'build', 'ios', 'iphoneos', 'Runner.app')
+    unless Dir.exist?(app_path)
+      app_path = Dir.glob(File.join(root_dir, 'build', 'ios', '**', 'Runner.app')).first
+    end
+    raise "Runner.app was not produced under #{File.join(root_dir, 'build', 'ios')}" if app_path.nil? || !Dir.exist?(app_path)
+
+    FileUtils.mkdir_p(output_directory)
+    payload_path = File.join(output_directory, 'Payload')
+    FileUtils.rm_rf(payload_path)
+    FileUtils.mkdir_p(payload_path)
+    FileUtils.cp_r(app_path, payload_path)
+
+    ipa_name = ENV.fetch('IPA_NAME', 'OneXray-ios-unsigned')
+    Dir.chdir(output_directory) do
+      ipa_path = "#{ipa_name}.ipa"
+      FileUtils.rm_f(ipa_path)
+      sh('zip', '-qry', ipa_path, 'Payload')
+      FileUtils.rm_rf('Payload')
+    end
+  end
+
+  lane :adhoc do
+    Dir.chdir('..') do
+      sh(*flutter_build_args('ipa'))
+    end
+
+    build_app(
+      skip_build_archive: true,
+      archive_path: '../build/ios/archive/Runner.xcarchive',
+      output_directory: File.expand_path('../../../output', __dir__),
+      output_name: ENV.fetch('IPA_NAME', 'OneXray-ios'),
+      export_options: {
+        method: ENV.fetch('EXPORT_METHOD', 'ad-hoc'),
+        provisioningProfiles: {
+          ENV.fetch('BUNDLE_ID_APP', 'net.yuandev.onexray') => ENV.fetch('PROFILE_APP_NAME'),
+          ENV.fetch('BUNDLE_ID_TUN', 'net.yuandev.onexray.tun') => ENV.fetch('PROFILE_TUN_NAME')
+        }
+      }
     )
   end
 

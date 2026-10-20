@@ -1,0 +1,169 @@
+#
+# Builds an iOS IPA for self-signing / sideloading.
+#
+# The upstream `Build` workflow's iOS job signs with an Apple Distribution
+# identity and uploads straight to TestFlight. This workflow produces an IPA
+# you own instead:
+#
+#   unsigned    — no Apple credentials at all. Runner.app is built with code
+#                 signing disabled and wrapped in an unencrypted IPA, ready
+#                 for a local re-signing tool (zsign, iOS App Signer, ...).
+#   adhoc       — signs in CI with your own certificate + provisioning
+#                 profiles. Nothing is uploaded to App Store Connect.
+#   development — same as adhoc with method `development`.
+#   enterprise  — same as adhoc with method `enterprise`.
+#
+# Xray-core version comes from the libXray ref. libXray tags mirror the Xray
+# release they wrap, so `v26.10.17` builds Xray-core 26.10.17.
+#
+# Required secrets for `unsigned`: none.
+# Required secrets for adhoc / development / enterprise (Settings → Secrets
+# and variables → Actions). File-like values are stored base64-encoded so the
+# secret editor never mangles newlines:
+#
+#   IOS_SIGNING_P12_BASE64    base64 of the signing certificate (.p12)
+#   IOS_SIGNING_P12_PASSWORD  password of that .p12
+#   KEYCHAIN_PASSWORD         password for the temporary build keychain
+#   IOS_PROFILE_APP_BASE64    base64 of the .mobileprovision for the app id
+#   IOS_PROFILE_TUN_BASE64    base64 of the .mobileprovision for <app id>.tun
+#
+# The bundle ids in ios/fastlane/Appfile and the Xcode project must match the
+# App IDs behind those profiles, and both profiles must carry the
+# Network Extension entitlement (a free Apple account cannot).
+#
+# Layout: build_scripts/app/builder.py#build_core expects XTLS/libXray as a
+# sibling of this repo, so this repo is checked out to `OneXray/` and libXray
+# to `libXray/` at the workspace root. Output lands in `<workspace>/output`.
+
+name: Build iOS (self-signed)
+
+run-name: iOS ${{ inputs.signing }} · libXray ${{ inputs.libxray_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      libxray_ref:
+        description: libXray ref (tag = Xray-core version)
+        required: true
+        default: v26.10.17
+      signing:
+        description: Signing mode
+        required: true
+        type: choice
+        default: unsigned
+        options:
+          - unsigned
+          - adhoc
+          - development
+          - enterprise
+      bundle_id:
+        description: App bundle id (must match your App ID and profile)
+        required: false
+        default: net.yuandev.onexray
+
+concurrency:
+  group: build-ios-selfsigned-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ios:
+    runs-on: xcode-27 # macOS 27 ARM64 (public preview)
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: OneXray
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: OneXray
+
+      - uses: actions/checkout@v7
+        id: libxray
+        with:
+          repository: XTLS/libXray
+          ref: ${{ inputs.libxray_ref }}
+          path: libXray
+
+      - name: Report Xray-core version
+        run: |
+          echo "libXray ref: ${{ inputs.libxray_ref }}"
+          echo "libXray sha: ${{ steps.libxray.outputs.commit }}"
+          grep -m1 'github.com/xtls/xray-core' ../libXray/go.mod || true
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+          check-latest: true
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.x"
+          enable-cache: false
+
+      - name: Setup Flutter
+        uses: ./OneXray/.github/actions/setup-flutter
+
+      - name: Import signing certificate
+        if: inputs.signing != 'unsigned'
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.IOS_SIGNING_P12_BASE64 }}
+          p12-password: ${{ secrets.IOS_SIGNING_P12_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+          keychain: signing_temp
+
+      - name: Verify code signing identities
+        if: inputs.signing != 'unsigned'
+        run: security find-identity -v -p codesigning
+
+      - name: Install provisioning profiles
+        if: inputs.signing != 'unsigned'
+        id: profiles
+        env:
+          PROFILE_APP_B64: ${{ secrets.IOS_PROFILE_APP_BASE64 }}
+          PROFILE_TUN_B64: ${{ secrets.IOS_PROFILE_TUN_BASE64 }}
+        run: |
+          set -euo pipefail
+          install_profile() {
+            local b64="$1" file="$2"
+            printf '%s' "$b64" | base64 -d > "$file"
+            security cms -D -i "$file" > "${file}.plist"
+            local uuid name
+            uuid=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "${file}.plist")
+            name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "${file}.plist")
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$file" "$HOME/Library/MobileDevice/Provisioning Profiles/${uuid}.mobileprovision"
+            printf '%s' "$name"
+          }
+          echo "app_name=$(install_profile "$PROFILE_APP_B64" /tmp/profile_app.mobileprovision)" >> "$GITHUB_OUTPUT"
+          echo "tun_name=$(install_profile "$PROFILE_TUN_B64" /tmp/profile_tun.mobileprovision)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+          ONEXRAY_IOS_LANE: ${{ inputs.signing == 'unsigned' && 'unsigned' || 'adhoc' }}
+          EXPORT_METHOD: ${{ inputs.signing }}
+          IPA_NAME: ${{ inputs.signing == 'unsigned' && 'OneXray-ios-unsigned' || 'OneXray-ios' }}
+          BUNDLE_ID_APP: ${{ inputs.bundle_id }}
+          BUNDLE_ID_TUN: ${{ inputs.bundle_id }}.tun
+          PROFILE_APP_NAME: ${{ steps.profiles.outputs.app_name }}
+          PROFILE_TUN_NAME: ${{ steps.profiles.outputs.tun_name }}
+        run: uv run --project build_scripts python build_scripts/main.py OneXray ios
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ios-${{ inputs.signing }}-${{ inputs.libxray_ref }}
+          path: output/OneXray-ios*.ipa
+          if-no-files-found: error

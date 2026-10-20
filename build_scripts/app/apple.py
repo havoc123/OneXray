@@ -1,5 +1,9 @@
+import os
+
 from app.builder import Builder
 from app.command_line import run_command
+
+DEFAULT_LANE = "deploy"
 
 
 class AppleBuilder(Builder):
@@ -11,4 +15,7 @@ class AppleBuilder(Builder):
         )
 
     def build_app(self):
-        run_command(["fastlane", "deploy", "--verbose"], cwd=self.project_dir)
+        # ONEXRAY_IOS_LANE selects an alternative fastlane lane (for example
+        # `unsigned` or `adhoc`) so self-signed builds can skip TestFlight.
+        lane = os.environ.get("ONEXRAY_IOS_LANE") or DEFAULT_LANE
+        run_command(["fastlane", lane, "--verbose"], cwd=self.project_dir)
